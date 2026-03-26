@@ -12,7 +12,7 @@ class Query(BaseModel):
 @app.post("/search")
 def search(query: Query):
     response = client.responses.create(
-        model="gpt-5.3",
+        model="gpt-4.1",
         input=query.question,
         tools=[{
             "type": "file_search",

@@ -5,7 +5,6 @@ import os
 
 app = FastAPI()
 client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
-
 VECTOR_STORE_ID = os.environ["VECTOR_STORE_ID"]
 
 class Query(BaseModel):
@@ -25,7 +24,4 @@ def search(query: Query):
             "vector_store_ids": [VECTOR_STORE_ID]
         }]
     )
-
-    return {
-        "answer": response.output_text
-    }
+    return {"answer": response.output_text}

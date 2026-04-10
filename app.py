@@ -271,12 +271,15 @@ def api_chat(query: Query):
 
 @app.get("/", response_class=HTMLResponse)
 def index():
-    return """
-<!doctype html>
+    return """<!doctype html>
 <html lang="sv">
 <head>
   <meta charset="utf-8">
-  <title>KT Arkivchat</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <style>
-    body { font-family: sans-serif; max-width: 800px
+  <title>KT Arkivchat API</title>
+</head>
+<body>
+  <h1>KT Arkivchat API</h1>
+  <p>API är igång.</p>
+</body>
+</html>
+"""

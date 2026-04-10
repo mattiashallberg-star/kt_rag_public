@@ -1,14 +1,38 @@
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
-from openai import OpenAI
+from openai import OpenAI, APIConnectionError, APITimeoutError, APIStatusError, RateLimitError
 import os
 import json
+import time
 from typing import Any
 
 app = FastAPI()
 
-client_kwargs: dict[str, Any] = {"api_key": os.environ["OPENAI_API_KEY"]}
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+OPENAI_TIMEOUT_SECONDS = _env_float("OPENAI_TIMEOUT_SECONDS", 45.0)
+OPENAI_CLIENT_RETRIES = _env_int("OPENAI_CLIENT_RETRIES", 2)
+TOOL_RETRY_COUNT = _env_int("TOOL_RETRY_COUNT", 1)
+
+client_kwargs: dict[str, Any] = {
+    "api_key": os.environ["OPENAI_API_KEY"],
+    "timeout": OPENAI_TIMEOUT_SECONDS,
+    "max_retries": OPENAI_CLIENT_RETRIES,
+}
 if os.environ.get("OPENAI_PROJECT"):
     client_kwargs["project"] = os.environ["OPENAI_PROJECT"]
 if os.environ.get("OPENAI_ORGANIZATION"):
@@ -21,7 +45,7 @@ MODEL_NAME = os.environ.get("OPENAI_MODEL", "gpt-4.1")
 
 class Query(BaseModel):
     question: str
-    max_results: int = Field(default=20, ge=1, le=100)
+    max_results: int = Field(default=8, ge=1, le=100)  # snabbare/stabilare default
     year: int | None = None
     issue: int | None = None
     issue_from: int | None = None
@@ -62,6 +86,48 @@ def build_attribute_filters(query: Query) -> dict[str, Any] | None:
     if len(filters) == 1:
         return filters[0]
     return {"type": "and", "filters": filters}
+
+
+def _is_retryable_status(exc: APIStatusError) -> bool:
+    return getattr(exc, "status_code", None) in {408, 409, 429, 500, 502, 503, 504}
+
+
+def _create_response_with_retry(
+    query: Query,
+    tool_config: dict[str, Any],
+    response_kwargs: dict[str, Any],
+    prompt: str,
+):
+    attempts = 1 + max(0, TOOL_RETRY_COUNT)
+    last_exc: Exception | None = None
+    current_max_results = int(tool_config.get("max_num_results", query.max_results))
+
+    for attempt in range(attempts):
+        attempt_tool_config = dict(tool_config)
+        attempt_tool_config["max_num_results"] = max(4, current_max_results)
+
+        try:
+            return client.responses.create(
+                model=MODEL_NAME,
+                input=prompt,
+                tools=[attempt_tool_config],
+                **response_kwargs,
+            )
+        except (APITimeoutError, APIConnectionError, RateLimitError) as exc:
+            last_exc = exc
+        except APIStatusError as exc:
+            if _is_retryable_status(exc):
+                last_exc = exc
+            else:
+                raise
+
+        if attempt < attempts - 1:
+            current_max_results = max(4, current_max_results // 2)
+            time.sleep(0.8 * (attempt + 1))
+
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("Unknown tool call error")
 
 
 def run_archive_search(query: Query) -> dict:
@@ -112,12 +178,16 @@ Användarens fråga:
     if query.include_search_results:
         response_kwargs["include"] = ["file_search_call.results"]
 
-    response = client.responses.create(
-        model=MODEL_NAME,
-        input=prompt,
-        tools=[tool_config],
-        **response_kwargs,
-    )
+    try:
+        response = _create_response_with_retry(query, tool_config, response_kwargs, prompt)
+    except Exception:
+        return {
+            "answer": "Arkivverktyget svarade inte just nu. Försök igen om en stund.",
+            "sources": [],
+            "applied_filters": attribute_filters,
+            "search_results_count": None,
+            "tool_error": True,
+        }
 
     raw_text = response.output_text
     search_results_count = 0
@@ -165,7 +235,6 @@ Användarens fråga:
         }
 
     except Exception:
-        # Fallback om modellen inte returnerar giltig JSON
         return {
             "answer": raw_text,
             "sources": [],
@@ -183,22 +252,23 @@ def health():
         "vector_store": VECTOR_STORE_ID,
         "project": os.environ.get("OPENAI_PROJECT"),
         "organization": os.environ.get("OPENAI_ORGANIZATION"),
+        "model": MODEL_NAME,
+        "openai_timeout_seconds": OPENAI_TIMEOUT_SECONDS,
+        "openai_client_retries": OPENAI_CLIENT_RETRIES,
+        "tool_retry_count": TOOL_RETRY_COUNT,
     }
 
 
-# Behåll denna för Custom GPT Action
 @app.post("/search")
 def search(query: Query):
     return run_archive_search(query)
 
 
-# Extra endpoint för vanlig frontend
 @app.post("/api/chat")
 def api_chat(query: Query):
     return run_archive_search(query)
 
 
-# Minimal testsida
 @app.get("/", response_class=HTMLResponse)
 def index():
     return """
@@ -209,85 +279,4 @@ def index():
   <title>KT Arkivchat</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <style>
-    body { font-family: sans-serif; max-width: 800px; margin: 40px auto; padding: 0 16px; }
-    textarea, button { font: inherit; }
-    textarea { width: 100%; min-height: 100px; margin-bottom: 12px; }
-    button { padding: 10px 16px; cursor: pointer; }
-    .card { border: 1px solid #ddd; border-radius: 8px; padding: 16px; margin-top: 20px; }
-    .source { margin-top: 12px; padding-top: 12px; border-top: 1px solid #eee; }
-    .meta { color: #555; font-size: 0.95em; margin-bottom: 6px; }
-    .answer { white-space: pre-wrap; }
-  </style>
-</head>
-<body>
-  <h1>KT Arkivchat</h1>
-  <p>Enkel testsida för backend och RAG-sökning.</p>
-
-  <textarea id="question" placeholder="Ställ en fråga om Kyrkans Tidnings arkiv..."></textarea>
-  <br>
-  <button id="askBtn">Fråga</button>
-
-  <div id="result" class="card" style="display:none;">
-    <h2>Svar</h2>
-    <div id="answer" class="answer"></div>
-
-    <h3>Källor</h3>
-    <div id="sources"></div>
-  </div>
-
-  <script>
-    const btn = document.getElementById("askBtn");
-    const questionEl = document.getElementById("question");
-    const resultEl = document.getElementById("result");
-    const answerEl = document.getElementById("answer");
-    const sourcesEl = document.getElementById("sources");
-
-    btn.addEventListener("click", async () => {
-      const question = questionEl.value.trim();
-      if (!question) return;
-
-      btn.disabled = true;
-      btn.textContent = "Söker...";
-
-      try {
-        const res = await fetch("/api/chat", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ question })
-        });
-
-        const data = await res.json();
-
-        resultEl.style.display = "block";
-        answerEl.textContent = data.answer || "";
-        sourcesEl.innerHTML = "";
-
-        (data.sources || []).forEach((src) => {
-          const div = document.createElement("div");
-          div.className = "source";
-
-          const meta = document.createElement("div");
-          meta.className = "meta";
-          meta.textContent =
-            `Nummer: ${src.issue || "okänt"} | År: ${src.year || "okänt"} | Sida: ${src.page || "okänd"}`;
-
-          const excerpt = document.createElement("div");
-          excerpt.textContent = src.excerpt || "";
-
-          div.appendChild(meta);
-          div.appendChild(excerpt);
-          sourcesEl.appendChild(div);
-        });
-      } catch (err) {
-        resultEl.style.display = "block";
-        answerEl.textContent = "Något gick fel.";
-        sourcesEl.innerHTML = "";
-      } finally {
-        btn.disabled = false;
-        btn.textContent = "Fråga";
-      }
-    });
-  </script>
-</body>
-</html>
-"""
+    body { font-family: sans-serif; max-width: 800px

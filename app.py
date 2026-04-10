@@ -56,6 +56,39 @@ class Query(BaseModel):
     include_search_results: bool = False
 
 
+def _normalize_meta_field(value: Any) -> str | None:
+    if value is None:
+        return None
+
+    if isinstance(value, (int, float)):
+        if int(value) <= 0:
+            return None
+        return str(int(value))
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    lowered = text.lower()
+    invalid_values = {
+        "0",
+        "nr 0",
+        "nr. 0",
+        "issue 0",
+        "okänt",
+        "okand",
+        "unknown",
+        "saknas",
+        "n/a",
+        "null",
+        "none",
+    }
+    if lowered in invalid_values:
+        return None
+
+    return text
+
+
 def build_attribute_filters(query: Query) -> dict[str, Any] | None:
     filters: list[dict[str, Any]] = []
 
@@ -144,6 +177,7 @@ Uppgift:
    - page: sida
    - excerpt: ett kort relevant utdrag eller sammanfattning
 3. Uppgifterna issue, year och page får bara anges om de faktiskt framgår av texten.
+   Om värdet saknas eller blir 0 ska du returnera null.
 4. Nämn inte interna filnamn, tekniska id:n eller vector store-information.
 5. Om underlaget är osäkert eller ofullständigt, säg det tydligt.
 6. Returnera svaret som JSON med exakt denna struktur:
@@ -219,10 +253,10 @@ Användarens fråga:
             if not isinstance(src, dict):
                 continue
             cleaned_sources.append({
-                "issue": src.get("issue"),
-                "year": src.get("year"),
-                "page": src.get("page"),
-                "excerpt": src.get("excerpt", "")
+                "issue": _normalize_meta_field(src.get("issue")),
+                "year": _normalize_meta_field(src.get("year")),
+                "page": _normalize_meta_field(src.get("page")),
+                "excerpt": str(src.get("excerpt", "")).strip()
             })
 
         return {

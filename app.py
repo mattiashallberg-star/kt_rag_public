@@ -35,9 +35,9 @@ def _env_bool(name: str, default: bool) -> bool:
 OPENAI_TIMEOUT_SECONDS = _env_float("OPENAI_TIMEOUT_SECONDS", 45.0)
 OPENAI_CLIENT_RETRIES = _env_int("OPENAI_CLIENT_RETRIES", 2)
 TOOL_RETRY_COUNT = _env_int("TOOL_RETRY_COUNT", 1)
-MAX_RESULTS_HARD_CAP = _env_int("MAX_RESULTS_HARD_CAP", 20)
+MAX_RESULTS_HARD_CAP = _env_int("MAX_RESULTS_HARD_CAP", 12)
 AUTO_BROADEN_SEARCH = _env_bool("AUTO_BROADEN_SEARCH", True)
-AUTO_BROADEN_TARGET = _env_int("AUTO_BROADEN_TARGET", 20)
+AUTO_BROADEN_TARGET = _env_int("AUTO_BROADEN_TARGET", 12)
 MIN_SOURCES_FOR_SINGLE_PASS = _env_int("MIN_SOURCES_FOR_SINGLE_PASS", 2)
 ALWAYS_INCLUDE_RESULTS = _env_bool("ALWAYS_INCLUDE_RESULTS", False)
 
@@ -58,7 +58,7 @@ MODEL_NAME = os.environ.get("OPENAI_MODEL", "gpt-4.1-mini")
 
 class Query(BaseModel):
     question: str
-    max_results: int = Field(default=8, ge=1, le=100)  # snabbare/stabilare default
+    max_results: int = Field(default=6, ge=1, le=100)  # snabbare/stabilare default
     year: int | None = None
     issue: int | None = None
     issue_from: int | None = None

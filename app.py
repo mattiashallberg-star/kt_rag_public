@@ -25,9 +25,21 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
 OPENAI_TIMEOUT_SECONDS = _env_float("OPENAI_TIMEOUT_SECONDS", 45.0)
 OPENAI_CLIENT_RETRIES = _env_int("OPENAI_CLIENT_RETRIES", 2)
 TOOL_RETRY_COUNT = _env_int("TOOL_RETRY_COUNT", 1)
+MAX_RESULTS_HARD_CAP = _env_int("MAX_RESULTS_HARD_CAP", 20)
+AUTO_BROADEN_SEARCH = _env_bool("AUTO_BROADEN_SEARCH", True)
+AUTO_BROADEN_TARGET = _env_int("AUTO_BROADEN_TARGET", 20)
+MIN_SOURCES_FOR_SINGLE_PASS = _env_int("MIN_SOURCES_FOR_SINGLE_PASS", 2)
+ALWAYS_INCLUDE_RESULTS = _env_bool("ALWAYS_INCLUDE_RESULTS", False)
 
 client_kwargs: dict[str, Any] = {
     "api_key": os.environ["OPENAI_API_KEY"],
@@ -41,7 +53,7 @@ if os.environ.get("OPENAI_ORGANIZATION"):
 
 client = OpenAI(**client_kwargs)
 VECTOR_STORE_ID = os.environ["VECTOR_STORE_ID"]
-MODEL_NAME = os.environ.get("OPENAI_MODEL", "gpt-4.1")
+MODEL_NAME = os.environ.get("OPENAI_MODEL", "gpt-4.1-mini")
 
 
 class Query(BaseModel):
@@ -328,66 +340,49 @@ def _create_response_with_retry(
     raise RuntimeError("Unknown tool call error")
 
 
-def run_archive_search(query: Query) -> dict:
-    prompt = f"""
-Du är en arkivassistent för Kyrkans Tidning.
+def _narrow_filters_present(query: Query) -> bool:
+    return any(
+        value is not None
+        for value in (
+            query.issue,
+            query.issue_from,
+            query.issue_to,
+            query.page,
+            query.page_from,
+            query.page_to,
+        )
+    )
 
-Använd endast material som hittas via file_search i vector store.
 
-Uppgift:
-1. Besvara användarens fråga kort, sakligt och tydligt på svenska.
-2. För varje relevant källa, extrahera om möjligt:
-   - issue: tidningens nummer/utgåva
-   - year: årtal
-   - page: sida
-   - excerpt: ett kort relevant utdrag eller sammanfattning
-3. Uppgifterna issue, year och page får bara anges om de faktiskt framgår av texten.
-   Om värdet saknas eller blir 0 ska du returnera null.
-4. Nämn inte interna filnamn, tekniska id:n eller vector store-information.
-5. Om underlaget är osäkert eller ofullständigt, säg det tydligt.
-6. Returnera svaret som JSON med exakt denna struktur:
+def _source_metadata_score(sources: list[dict[str, Any]]) -> int:
+    score = 0
+    for src in sources:
+        if src.get("issue"):
+            score += 1
+        if src.get("year"):
+            score += 1
+        if src.get("page"):
+            score += 1
+    return score
 
-{{
-  "answer": "kort svar till användaren",
-  "sources": [
-    {{
-      "issue": "string eller null",
-      "year": "string eller null",
-      "page": "string eller null",
-      "excerpt": "string"
-    }}
-  ]
-}}
 
-Användarens fråga:
-{query.question}
-""".strip()
+def _payload_score(payload: dict[str, Any]) -> tuple[int, int, int]:
+    sources = payload.get("sources")
+    if not isinstance(sources, list):
+        sources = []
+    answer = payload.get("answer", "")
+    return (
+        len(sources),
+        _source_metadata_score(sources),  # prefer richer source metadata
+        len(str(answer)),
+    )
 
-    tool_config: dict[str, Any] = {
-        "type": "file_search",
-        "vector_store_ids": [VECTOR_STORE_ID],
-        "max_num_results": query.max_results,
-    }
 
-    attribute_filters = build_attribute_filters(query)
-    if attribute_filters:
-        tool_config["filters"] = attribute_filters
-
-    response_kwargs: dict[str, Any] = {
-        "include": ["file_search_call.results"],
-    }
-
-    try:
-        response = _create_response_with_retry(query, tool_config, response_kwargs, prompt)
-    except Exception:
-        return {
-            "answer": "Arkivverktyget svarade inte just nu. Försök igen om en stund.",
-            "sources": [],
-            "applied_filters": attribute_filters,
-            "search_results_count": None,
-            "tool_error": True,
-        }
-
+def _build_payload_from_response(
+    response: Any,
+    query: Query,
+    attribute_filters: dict[str, Any] | None,
+) -> dict[str, Any]:
     raw_text = response.output_text
     search_results_count = 0
     result_meta_candidates = _extract_result_meta_candidates(response)
@@ -460,6 +455,108 @@ Användarens fråga:
         }
 
 
+def run_archive_search(query: Query) -> dict:
+    prompt = f"""
+Du är en arkivassistent för Kyrkans Tidning.
+
+Använd endast material som hittas via file_search i vector store.
+
+Uppgift:
+1. Besvara användarens fråga kort, sakligt och tydligt på svenska.
+2. För varje relevant källa, extrahera om möjligt:
+   - issue: tidningens nummer/utgåva
+   - year: årtal
+   - page: sida
+   - excerpt: ett kort relevant utdrag eller sammanfattning
+3. Uppgifterna issue, year och page får bara anges om de faktiskt framgår av texten.
+   Om värdet saknas eller blir 0 ska du returnera null.
+4. Nämn inte interna filnamn, tekniska id:n eller vector store-information.
+5. Om underlaget är osäkert eller ofullständigt, säg det tydligt.
+6. Returnera svaret som JSON med exakt denna struktur:
+
+{{
+  "answer": "kort svar till användaren",
+  "sources": [
+    {{
+      "issue": "string eller null",
+      "year": "string eller null",
+      "page": "string eller null",
+      "excerpt": "string"
+    }}
+  ]
+}}
+
+Användarens fråga:
+{query.question}
+""".strip()
+
+    safe_max_results = max(1, min(int(query.max_results), max(1, MAX_RESULTS_HARD_CAP)))
+
+    tool_config: dict[str, Any] = {
+        "type": "file_search",
+        "vector_store_ids": [VECTOR_STORE_ID],
+        "max_num_results": safe_max_results,
+    }
+
+    attribute_filters = build_attribute_filters(query)
+    if attribute_filters:
+        tool_config["filters"] = attribute_filters
+
+    response_kwargs: dict[str, Any] = {}
+    if query.include_search_results or ALWAYS_INCLUDE_RESULTS:
+        response_kwargs["include"] = ["file_search_call.results"]
+
+    try:
+        first_response = _create_response_with_retry(query, tool_config, response_kwargs, prompt)
+    except Exception:
+        return {
+            "answer": "Arkivverktyget svarade inte just nu. Försök igen om en stund.",
+            "sources": [],
+            "applied_filters": attribute_filters,
+            "search_results_count": None,
+            "tool_error": True,
+        }
+
+    best_payload = _build_payload_from_response(first_response, query, attribute_filters)
+
+    can_broaden = (
+        AUTO_BROADEN_SEARCH
+        and not _narrow_filters_present(query)
+        and safe_max_results < min(AUTO_BROADEN_TARGET, MAX_RESULTS_HARD_CAP)
+    )
+
+    if can_broaden:
+        first_sources = best_payload.get("sources", [])
+        first_count = len(first_sources) if isinstance(first_sources, list) else 0
+        if first_count < max(1, MIN_SOURCES_FOR_SINGLE_PASS):
+            broadened_max = max(
+                safe_max_results,
+                min(AUTO_BROADEN_TARGET, MAX_RESULTS_HARD_CAP),
+            )
+            broadened_tool_config = dict(tool_config)
+            broadened_tool_config["max_num_results"] = broadened_max
+
+            try:
+                second_response = _create_response_with_retry(
+                    query,
+                    broadened_tool_config,
+                    response_kwargs,
+                    prompt,
+                )
+                second_payload = _build_payload_from_response(
+                    second_response,
+                    query,
+                    attribute_filters,
+                )
+                if _payload_score(second_payload) > _payload_score(best_payload):
+                    best_payload = second_payload
+            except Exception:
+                # Keep first successful payload if broadened pass fails.
+                pass
+
+    return best_payload
+
+
 @app.get("/health")
 def health():
     return {
@@ -471,6 +568,11 @@ def health():
         "openai_timeout_seconds": OPENAI_TIMEOUT_SECONDS,
         "openai_client_retries": OPENAI_CLIENT_RETRIES,
         "tool_retry_count": TOOL_RETRY_COUNT,
+        "max_results_hard_cap": MAX_RESULTS_HARD_CAP,
+        "auto_broaden_search": AUTO_BROADEN_SEARCH,
+        "auto_broaden_target": AUTO_BROADEN_TARGET,
+        "min_sources_for_single_pass": MIN_SOURCES_FOR_SINGLE_PASS,
+        "always_include_results": ALWAYS_INCLUDE_RESULTS,
     }
 
 

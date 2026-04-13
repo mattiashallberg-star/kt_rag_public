@@ -5,6 +5,7 @@ from openai import OpenAI, APIConnectionError, APITimeoutError, APIStatusError, 
 import os
 import json
 import time
+import re
 from typing import Any
 
 app = FastAPI()
@@ -87,6 +88,170 @@ def _normalize_meta_field(value: Any) -> str | None:
         return None
 
     return text
+
+
+def _to_plain_dict(obj: Any) -> dict[str, Any]:
+    if isinstance(obj, dict):
+        return obj
+    if hasattr(obj, "model_dump"):
+        try:
+            dumped = obj.model_dump()
+            if isinstance(dumped, dict):
+                return dumped
+        except Exception:
+            pass
+    if hasattr(obj, "dict"):
+        try:
+            dumped = obj.dict()
+            if isinstance(dumped, dict):
+                return dumped
+        except Exception:
+            pass
+    return {}
+
+
+def _parse_positive_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if isinstance(value, float):
+        iv = int(value)
+        return iv if iv > 0 else None
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    match = re.search(r"\d+", text)
+    if not match:
+        return None
+    iv = int(match.group(0))
+    return iv if iv > 0 else None
+
+
+def _issue_from_attrs(attrs: dict[str, Any]) -> str | None:
+    issue_text = _normalize_meta_field(attrs.get("issue_number_text"))
+    if issue_text and issue_text != "0":
+        return issue_text.replace("/", "-")
+
+    start = _parse_positive_int(attrs.get("issue_start"))
+    end = _parse_positive_int(attrs.get("issue_end"))
+    if start and end:
+        return str(start) if start == end else f"{start}-{end}"
+    return None
+
+
+def _extract_text_blob(result_dict: dict[str, Any]) -> str:
+    for key in ("text", "content", "snippet", "excerpt"):
+        value = result_dict.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+        if isinstance(value, list):
+            parts: list[str] = []
+            for item in value:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict):
+                    maybe_text = item.get("text") or item.get("content")
+                    if isinstance(maybe_text, str):
+                        parts.append(maybe_text)
+            merged = "\n".join(p for p in parts if p)
+            if merged.strip():
+                return merged
+    return ""
+
+
+def _issue_from_text(text: str) -> str | None:
+    if not text:
+        return None
+    patterns = [
+        r"Kyrkans Tidning\s+nr\.?\s*([0-9]{1,2}(?:[/-][0-9]{1,2})?)",
+        r"\bNr\.?\s*([0-9]{1,2}(?:[/-][0-9]{1,2})?)\b",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if not match:
+            continue
+        token = match.group(1).replace("/", "-").strip()
+        if token in {"0", "00"}:
+            return None
+        return token
+    return None
+
+
+def _page_from_text(text: str) -> str | None:
+    if not text:
+        return None
+    match = re.search(r"(?:---\s*)?sida\s+(\d{1,3})\s+av\s+\d{1,4}", text, flags=re.IGNORECASE)
+    if not match:
+        return None
+    page = _parse_positive_int(match.group(1))
+    return str(page) if page else None
+
+
+def _extract_result_meta_candidates(response: Any) -> list[dict[str, str | None]]:
+    candidates: list[dict[str, str | None]] = []
+    for item in getattr(response, "output", []):
+        if getattr(item, "type", None) != "file_search_call":
+            continue
+        result_items = getattr(item, "results", None) or getattr(item, "search_results", None)
+        if not result_items:
+            continue
+        for result in result_items:
+            rd = _to_plain_dict(result)
+            attrs = rd.get("attributes")
+            attrs = attrs if isinstance(attrs, dict) else {}
+            text_blob = _extract_text_blob(rd)
+
+            issue = _issue_from_attrs(attrs) or _issue_from_text(text_blob)
+            year = _normalize_meta_field(attrs.get("year"))
+            page = _normalize_meta_field(attrs.get("page_number")) or _page_from_text(text_blob)
+
+            candidates.append({
+                "issue": issue,
+                "year": year,
+                "page": page,
+                "text": text_blob,
+            })
+    return candidates
+
+
+def _tokenize(text: str) -> set[str]:
+    return {
+        w.lower()
+        for w in re.findall(r"[A-Za-zÅÄÖåäö0-9]{4,}", text or "")
+    }
+
+
+def _best_candidate_for_excerpt(
+    excerpt: str,
+    candidates: list[dict[str, str | None]],
+) -> dict[str, str | None] | None:
+    if not candidates:
+        return None
+
+    excerpt_tokens = _tokenize(excerpt)
+    best: dict[str, str | None] | None = None
+    best_score = 0
+
+    for cand in candidates:
+        cand_tokens = _tokenize(str(cand.get("text") or ""))
+        if not excerpt_tokens or not cand_tokens:
+            score = 0
+        else:
+            score = len(excerpt_tokens.intersection(cand_tokens))
+        if score > best_score:
+            best = cand
+            best_score = score
+
+    if best and best_score >= 2:
+        return best
+
+    complete = [c for c in candidates if c.get("issue") and c.get("page")]
+    if len(complete) == 1:
+        return complete[0]
+    return None
 
 
 def build_attribute_filters(query: Query) -> dict[str, Any] | None:
@@ -208,9 +373,9 @@ Användarens fråga:
     if attribute_filters:
         tool_config["filters"] = attribute_filters
 
-    response_kwargs: dict[str, Any] = {}
-    if query.include_search_results:
-        response_kwargs["include"] = ["file_search_call.results"]
+    response_kwargs: dict[str, Any] = {
+        "include": ["file_search_call.results"],
+    }
 
     try:
         response = _create_response_with_retry(query, tool_config, response_kwargs, prompt)
@@ -225,6 +390,7 @@ Användarens fråga:
 
     raw_text = response.output_text
     search_results_count = 0
+    result_meta_candidates = _extract_result_meta_candidates(response)
 
     for item in getattr(response, "output", []):
         if getattr(item, "type", None) == "file_search_call":
@@ -252,12 +418,27 @@ Användarens fråga:
         for src in sources[:8]:
             if not isinstance(src, dict):
                 continue
-            cleaned_sources.append({
+            cleaned = {
                 "issue": _normalize_meta_field(src.get("issue")),
                 "year": _normalize_meta_field(src.get("year")),
                 "page": _normalize_meta_field(src.get("page")),
                 "excerpt": str(src.get("excerpt", "")).strip()
-            })
+            }
+
+            if not (cleaned["issue"] and cleaned["year"] and cleaned["page"]):
+                best = _best_candidate_for_excerpt(cleaned["excerpt"], result_meta_candidates)
+                if best:
+                    if not cleaned["issue"]:
+                        cleaned["issue"] = _normalize_meta_field(best.get("issue"))
+                    if not cleaned["year"]:
+                        cleaned["year"] = _normalize_meta_field(best.get("year"))
+                    if not cleaned["page"]:
+                        cleaned["page"] = _normalize_meta_field(best.get("page"))
+
+            if not cleaned["year"] and query.year is not None:
+                cleaned["year"] = str(query.year)
+
+            cleaned_sources.append(cleaned)
 
         return {
             "answer": answer,

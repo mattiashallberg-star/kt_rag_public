@@ -32,13 +32,13 @@ def _env_bool(name: str, default: bool) -> bool:
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
-OPENAI_TIMEOUT_SECONDS = _env_float("OPENAI_TIMEOUT_SECONDS", 45.0)
-OPENAI_CLIENT_RETRIES = _env_int("OPENAI_CLIENT_RETRIES", 2)
-TOOL_RETRY_COUNT = _env_int("TOOL_RETRY_COUNT", 1)
+OPENAI_TIMEOUT_SECONDS = _env_float("OPENAI_TIMEOUT_SECONDS", 30.0)
+OPENAI_CLIENT_RETRIES = _env_int("OPENAI_CLIENT_RETRIES", 1)
+TOOL_RETRY_COUNT = _env_int("TOOL_RETRY_COUNT", 0)
 MAX_RESULTS_HARD_CAP = _env_int("MAX_RESULTS_HARD_CAP", 12)
-AUTO_BROADEN_SEARCH = _env_bool("AUTO_BROADEN_SEARCH", True)
+AUTO_BROADEN_SEARCH = _env_bool("AUTO_BROADEN_SEARCH", False)
 AUTO_BROADEN_TARGET = _env_int("AUTO_BROADEN_TARGET", 12)
-MIN_SOURCES_FOR_SINGLE_PASS = _env_int("MIN_SOURCES_FOR_SINGLE_PASS", 2)
+MIN_SOURCES_FOR_SINGLE_PASS = _env_int("MIN_SOURCES_FOR_SINGLE_PASS", 1)
 ALWAYS_INCLUDE_RESULTS = _env_bool("ALWAYS_INCLUDE_RESULTS", False)
 
 client_kwargs: dict[str, Any] = {
@@ -576,7 +576,7 @@ def health():
     }
 
 
-@app.post("/search")
+@app.post("/search", operation_id="searchSearchPost", summary="Search")
 def search(query: Query):
     return run_archive_search(query)
 
